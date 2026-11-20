@@ -1,0 +1,28 @@
+      // magpie's "Import accounts from a file…" (OpenCode ignores these):
+      // the same parser as the account-file page, one sign-in result per
+      // account. Each account is renewed first, so the file's refresh token
+      // is spent here and the tool it came from is signed out of it.
+      importFrom:
+        "Choose one or more account JSON files — an agent2api export (an array of CodeArts accounts) or one account by itself. Each account is renewed with Huawei Cloud when it is imported, so the tool the file came from is signed out of it.",
+      importFroms: {
+        zh: "选择一个或多个账号 JSON 文件——agent2api 导出的 CodeArts 账号数组，或单个账号。每个账号在导入时会先向华为云续期，所以文件来源的工具会退出该账号。",
+        "zh-TW": "選擇一個或多個帳號 JSON 檔案——agent2api 匯出的 CodeArts 帳號陣列，或單個帳號。每個帳號在匯入時會先向華為雲續期，所以檔案來源的工具會登出該帳號。",
+      },
+      import: async (texts) => {
+        const results = []
+        for (const text of Array.isArray(texts) ? texts : [texts]) {
+          const { entries, skipped } = importedAccountsIn(String(text ?? ""))
+          for (const skip of skipped) results.push({ type: "failed", error: skip.why })
+          for (const entry of entries) {
+            const got = await prepareImportedAccount(entry, { renewOnce, fetcher })
+            results.push(got.error ? { type: "failed", error: got.error } : { ...codeArtsRecordBody(got.cred), type: "success" })
+          }
+        }
+        return results
+      },
+
+      // This card's one sign-in: the account-file page, in place of the
+      // upstream card's browser and CodeArts Agent sign-ins.
+      get methods() {
+        return [importMethod]
+      },

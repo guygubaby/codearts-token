@@ -1,0 +1,9 @@
+// This fork (codearts-token) serves the same card on a provider id of its own
+// and adds one sign-in: an account file. A page the plugin serves takes one or
+// more JSON files — an agent2api export (an array of accounts carrying
+// access_key_id / secret_access_key / security_token / refresh_token and the
+// PKCE verifier + DPoP key they were issued with), or one account by itself —
+// and each account becomes its own magpie account. magpie's own "Import
+// accounts from a file…" (auth.import) is served from the same parser. The
+// OAuth and CodeArts Agent sign-ins of the upstream card stay in this file but
+// are not offered: this card exists for the account files.

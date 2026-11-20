@@ -1,0 +1,9 @@
+  // The card's one sign-in: account files. The OAuth and CodeArts Agent
+  // methods above stay for the upstream package's code (and the tests), but
+  // this card exists for the files and offers nothing else.
+  const importMethod = {
+    type: "oauth",
+    label: "CodeArts Token account file (browser)",
+    authorize: () => startImportPage({ client, fetcher, renewOnce }),
+  }
+

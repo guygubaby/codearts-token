@@ -1,0 +1,331 @@
+// ---- accounts from a file (agent2api export / magpie's auth.import) --------
+
+/**
+ * The expires_at a file names, as this package stores it. agent2api writes
+ * both an ISO `expires_at` and the same moment in ms `expiresAt`; a file with
+ * only the number gets it converted (ms or s, told apart by magnitude).
+ * `Date.parse` of a number is NaN, which would read as "no expiry".
+ */
+function importedExpiry(iso, at) {
+  const parsedIso = Date.parse(typeof iso === "string" ? iso : "")
+  if (Number.isFinite(parsedIso)) return new Date(parsedIso).toISOString()
+  const n = Number(at)
+  if (Number.isFinite(n) && n > 0) return new Date(n < 1e12 ? n * 1000 : n).toISOString()
+  return ""
+}
+
+/** The file's own name for an entry, for a skip message (never a credential). */
+function importedLabelOf(a) {
+  const src = asRecord(a?.pluginSecret)
+  return firstOf(a?.name, a?.user_name, src.name, src.user_name)
+}
+
+/**
+ * One entry of the exported file as this card's credential.
+ *
+ * agent2api's shape is flat (`access_key_id`, `secret_access_key`,
+ * `security_token`, `refresh_token`, `oauth_context.{dpop_key_pair,pkce_pair}`),
+ * with the same fields repeated under `pluginSecret`; either is read. The
+ * PKCE verifier and the DPoP private key are what a renewal signs with, so a
+ * credential without them can only be used until it expires.
+ *
+ * Returns `{ cred, renewable, label }`, or `{ why }` when the entry cannot be
+ * an account of this card.
+ */
+function importedAccountCredential(a) {
+  if (!a || typeof a !== "object" || Array.isArray(a)) return { why: "not an account object" }
+  const provider = firstOf(a.provider)
+  if (provider && provider !== "codearts" && provider !== PROVIDER) {
+    return { why: `not a CodeArts account (provider "${provider}")` }
+  }
+  const secret = asRecord(a.pluginSecret)
+  const ctx = asRecord(a.oauth_context)
+  const secretCtx = asRecord(secret.oauth_context)
+  const pick = (k) => firstOf(a[k], secret[k])
+  const cred = {
+    access_key_id: firstOf(a.access_key_id, a.accessToken, secret.access_key_id, secret.accessToken),
+    secret_access_key: pick("secret_access_key"),
+    security_token: pick("security_token"),
+    expires_at: importedExpiry(a.expires_at, a.expiresAt),
+    refresh_token: firstOf(a.refresh_token, a.refreshToken, secret.refresh_token, secret.refreshToken),
+    code_verifier: firstOf(asRecord(ctx.pkce_pair).code_verifier, asRecord(secretCtx.pkce_pair).code_verifier),
+    dpop_private_key_jwk: asRecord(ctx.dpop_key_pair).private_key_jwk ?? asRecord(secretCtx.dpop_key_pair).private_key_jwk ?? null,
+    // Minted here, as a sign-in mints it: this credential's one upstream session.
+    session_id: randomHex(16),
+    ...(pick("domain_id") ? { domain_id: pick("domain_id") } : {}),
+    ...(pick("user_name") ? { user_name: pick("user_name") } : {}),
+  }
+  if (!cred.access_key_id || !cred.secret_access_key || !cred.security_token) {
+    return { why: "no temporary credentials (access_key_id / secret_access_key / security_token)" }
+  }
+  const renewable = !!(cred.refresh_token && cred.code_verifier && cred.dpop_private_key_jwk)
+  const usable = Number.isFinite(Date.parse(cred.expires_at)) && Date.parse(cred.expires_at) > Date.now()
+  if (!renewable && !usable) {
+    return { why: "the credential has expired and carries no refresh token, PKCE verifier and DPoP key to renew it" }
+  }
+  if (!accountIdentityOf(cred).id) return { why: "the account names no identity (no refresh token and no user name)" }
+  const identity = accountIdentityOf(cred)
+  return { cred, renewable, label: identity.name || firstOf(cred.user_name, identity.id) || importedLabelOf(a) }
+}
+
+/**
+ * Every account a file's text holds: agent2api's array, one account by itself,
+ * or `{ accounts: [...] }`. Each is `{ cred, renewable, label }`; what cannot
+ * be used is `{ name, why }` and never stops the rest.
+ */
+function importedAccountsIn(text) {
+  let value
+  try {
+    value = JSON.parse(text)
+  } catch {
+    return { entries: [], skipped: [{ why: "not JSON" }] }
+  }
+  const list = Array.isArray(value) ? value : Array.isArray(value?.accounts) ? value.accounts : [value]
+  const entries = []
+  const skipped = []
+  list.forEach((a, i) => {
+    const got = importedAccountCredential(a)
+    if (got.why) skipped.push({ name: importedLabelOf(a) || `#${i + 1}`, why: got.why })
+    else entries.push(got)
+  })
+  return { entries, skipped }
+}
+
+/**
+ * One imported entry taken over by this plugin, the way a sign-in takes an
+ * account: renewed first (a Huawei Cloud refresh token is spent once, so the
+ * file's copy must not go on being used elsewhere), its phone read best
+ * effort, and its identity from the renewal's token. `{ cred, identity,
+ * label }`, or `{ error }` when the account cannot be brought in.
+ */
+async function prepareImportedAccount(entry, { renewOnce, fetcher, now = Date.now }) {
+  let cred = entry.cred
+  if (entry.renewable) {
+    try {
+      cred = await renewOnce(cred)
+    } catch (e) {
+      if (isPermanentRefreshFailure(e)) {
+        return { error: `the refresh token was turned away (spent or expired) — export the account again` }
+      }
+      // STS unreachable right now: the file's own credentials stand while they last.
+      if (!(Date.parse(cred.expires_at ?? "") > now())) {
+        return { error: `the credential could not be renewed and has expired: ${e?.message ?? e}` }
+      }
+    }
+  }
+  const phone = await accountPhoneField(cred, fetcher).catch(() => ({}))
+  cred = { ...cred, ...phone }
+  const identity = accountIdentityOf(cred)
+  if (!identity.id) return { error: "the account names no identity" }
+  return { cred, identity, label: identity.name || entry.label || identity.id }
+}
+
+// IMPORT_PAGE is the page the account-file sign-in opens: the user picks one
+// or more JSON files and the page posts their text back to the same URL.
+const IMPORT_PAGE = `<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CodeArts account import</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.6 system-ui, -apple-system, "PingFang SC", sans-serif; max-width: 560px; margin: 48px auto; padding: 0 20px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  p { margin: 10px 0; }
+  input[type=file] { display: block; margin: 18px 0; }
+  button { font: inherit; padding: 8px 20px; border: 0; border-radius: 8px; background: #2563eb; color: #fff; cursor: pointer; }
+  button:disabled { opacity: .45; cursor: default; }
+  pre { white-space: pre-wrap; word-break: break-all; background: rgba(127,127,127,.14); padding: 12px; border-radius: 8px; min-height: 1.6em; }
+</style>
+<h1>CodeArts account import</h1>
+<p>Choose one or more account JSON files (an agent2api export, or one account by itself), then click Import.</p>
+<input type="file" multiple accept=".json,application/json">
+<p><button disabled>Import</button></p>
+<pre></pre>
+<script>
+var input = document.querySelector("input")
+var btn = document.querySelector("button")
+var out = document.querySelector("pre")
+input.onchange = function () {
+  btn.disabled = !input.files.length
+  out.textContent = Array.prototype.map.call(input.files, function (f) { return f.name }).join("\\n")
+}
+btn.onclick = async function () {
+  btn.disabled = true
+  out.textContent = "Uploading…"
+  var files = []
+  for (var i = 0; i < input.files.length; i++) files.push({ name: input.files[i].name, text: await input.files[i].text() })
+  try {
+    var r = await fetch(location.href, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ files: files }) })
+    out.textContent = await r.text()
+  } catch (e) {
+    out.textContent = "Upload failed: " + e.message
+  }
+}
+</script>
+</html>
+`
+
+// liveImport is the upload page a sign-in left open, if any: a sign-in
+// started again closes it first, so the port is free for the new page even
+// when the first was never finished (magpie cancelled it, or the user just
+// started another).
+let liveImport = null
+
+function stopImport(self, why) {
+  if (!self) return Promise.resolve()
+  if (liveImport === self) liveImport = null
+  if (self.timer) clearTimeout(self.timer)
+  if (why && !self.settled) {
+    self.settled = true
+    self.settle(why)
+  }
+  try {
+    self.server?.closeAllConnections?.()
+  } catch {}
+  return new Promise((resolve) => {
+    try {
+      self.server?.close(() => resolve())
+    } catch {
+      resolve()
+    }
+  })
+}
+
+/**
+ * Serve that page for one sign-in and wait for it. magpie's sign-in prompts
+ * have no file picker, so the plugin brings its own: a one-time token in the
+ * URL, a loopback port (CODEARTS_IMPORT_PORT, 3432 by default), and the
+ * address the browser reaches it at (CODEARTS_IMPORT_HOST, 127.0.0.1 by
+ * default).
+ *
+ * Every account is written under `codearts-token#<hash of its identity>` so
+ * importing the same account again updates its record instead of adding a
+ * second one; the first is also the sign-in's own result, which the host
+ * saves itself.
+ */
+async function startImportPage({ client, fetcher, renewOnce }) {
+  // a page still open from an earlier sign-in holds the port: close it
+  await stopImport(liveImport, { type: "failed", error: "Superseded by a newer account import" })
+  const token = randomHex(24)
+  const wantPort = Number(process.env.CODEARTS_IMPORT_PORT || 3432)
+  const publicHost = process.env.CODEARTS_IMPORT_HOST || "127.0.0.1"
+  const bind = process.env.CODEARTS_IMPORT_BIND || (publicHost === "127.0.0.1" ? "127.0.0.1" : "0.0.0.0")
+  const state = { server: null, settled: false, timer: null, settle: null }
+  const finished = new Promise((resolve) => (state.settle = resolve))
+  const server = createServer(async (req, res) => {
+    const url = new URL(req.url ?? "/", "http://localhost")
+    const say = (code, body, type = "text/plain; charset=utf-8") => {
+      res.writeHead(code, { "content-type": type, "cache-control": "no-store", "x-content-type-options": "nosniff" })
+      res.end(body)
+    }
+    if (url.searchParams.get("t") !== token) return say(404, "not found")
+    if (req.method === "GET") return say(200, IMPORT_PAGE, "text/html; charset=utf-8")
+    if (req.method !== "POST") return say(405, "method not allowed")
+    if (state.settled) return say(409, "this import is already done")
+    // the sign-in finishes only after this answer has left: its callback
+    // closes the server, and closing it under the response cut the socket
+    const answer = (result) => {
+      const done = () => {
+        if (state.settled) return
+        state.settled = true
+        state.settle(result)
+      }
+      res.once("finish", done)
+      res.once("close", done)
+    }
+    let body = ""
+    try {
+      for await (const chunk of req) {
+        body += chunk
+        if (body.length > 8 << 20) throw new Error("the upload is over 8 MB")
+      }
+      const input = JSON.parse(body)
+      const files = Array.isArray(input?.files) ? input.files : [{ name: "pasted", text: String(input?.text ?? "") }]
+      const pending = []
+      const skipped = []
+      files.forEach((f, i) => {
+        const found = importedAccountsIn(String(f?.text ?? ""))
+        for (const s of found.skipped) skipped.push({ name: String(f?.name ?? `#${i + 1}`), why: s.why })
+        for (const entry of found.entries) pending.push({ entry, name: String(f?.name ?? `#${i + 1}`) })
+      })
+      const imported = []
+      for (const { entry, name } of pending) {
+        const got = await prepareImportedAccount(entry, { renewOnce, fetcher })
+        if (got.error) skipped.push({ name, why: got.error })
+        else imported.push({ ...got, name })
+      }
+      for (const a of imported) {
+        try {
+          await client?.auth?.set?.({
+            path: { id: `${PROVIDER}#${accountKeySuffix(a.identity.id)}` },
+            body: codeArtsRecordBody(a.cred),
+          })
+        } catch (e) {
+          skipped.push({ name: a.name, why: e?.message ?? String(e) })
+        }
+      }
+      if (!imported.length) throw new Error(`No account imported${skipped[0] ? ` — ${skipped[0].name}: ${skipped[0].why}` : ""}`)
+      const first = imported[0]
+      const body0 = codeArtsRecordBody(first.cred)
+      const said = `Imported ${imported.length} account${imported.length === 1 ? "" : "s"}${skipped.length ? `, skipped ${skipped.length}` : ""}`
+      if ((imported.length > 1 || skipped.length) && client?.tui?.showToast) {
+        try {
+          await client.tui.showToast({ body: { title: "CodeArts Token", message: said } })
+        } catch {}
+      }
+      answer({ ...body0, type: "success" })
+      return say(200, `${said}${skipped.length ? `\n${skipped.map((s) => `- ${s.name}: ${s.why}`).join("\n")}` : ""}\n\nYou can close this page and return to magpie.`)
+    } catch (e) {
+      answer({ type: "failed", error: e?.message ?? String(e) })
+      return say(400, `No account imported: ${e?.message ?? e}`)
+    }
+  })
+  state.server = server
+  const listen = (port) =>
+    new Promise((resolve, reject) => {
+      const onError = (e) => reject(e)
+      server.once("error", onError)
+      server.listen(port, bind, () => {
+        server.off("error", onError)
+        resolve(server.address().port)
+      })
+    })
+  let port
+  try {
+    port = await listen(wantPort > 0 ? wantPort : 0)
+  } catch (e) {
+    if (e?.code !== "EADDRINUSE" || !wantPort) {
+      await stopImport(state)
+      return { type: "failed", error: `Can't listen on ${bind}:${wantPort}: ${e?.message ?? e}` }
+    }
+    // the chosen port is taken: the system picks one instead
+    try {
+      port = await listen(0)
+    } catch (e2) {
+      await stopImport(state)
+      return { type: "failed", error: `Can't listen on ${bind}: ${e2?.message ?? e2}` }
+    }
+  }
+  liveImport = state
+  state.timer = setTimeout(() => {
+    if (!state.settled) {
+      state.settled = true
+      state.settle({ type: "failed", error: "The import page timed out after 5 minutes" })
+    }
+    stopImport(state)
+  }, 5 * 60 * 1000)
+  return {
+    url: `http://${publicHost}:${port}/import?t=${token}`,
+    instructions: "Choose one or more account JSON files in the page that opens.",
+    method: "auto",
+    async callback() {
+      try {
+        return await finished
+      } finally {
+        await stopImport(state)
+      }
+    },
+  }
+}
+
