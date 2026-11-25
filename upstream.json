@@ -1,10 +1,10 @@
 {
-  "version": "0.3.24",
+  "version": "0.3.25",
   "files": {
-    "index.mjs": "8de5df0030bfdbf67c4a6c49c4c20a5c4848d3cb693eef7b0fd177d1a20ee59e",
+    "index.mjs": "4e2d58680f71f2b0f9e3558003dd961070b06f5164ccdedd1371b75984bb9169",
     "opencode.mjs": "e44994599c1f6fdbc0e2898fb017195acc6630db0d4d2023ab15e8227b95563c",
     "opencode2.mjs": "062365696c3d64a6526f6514093a315ecb4d14be738ab779ffaf2394c4ead900",
-    "package.json": "99ea6980c5a36d84716f28b0d6f99e1dc395178e69aad11496a209c2b89c7e8e"
+    "package.json": "dfb977236df74a3c8daf6befe3236e546fd7fd3a3d2fd1348b548c25258a4296"
   },
-  "syncedAt": "2026-11-25T14:24:35.620Z"
+  "syncedAt": "2026-11-25T19:51:22.472Z"
 }
