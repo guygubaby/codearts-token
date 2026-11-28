@@ -1,6 +1,6 @@
 {
   "name": "opencode-codearts-token-import",
-  "version": "0.3.27",
+  "version": "0.3.28",
   "description": "CodeArts (华为云码道) account-file sign-in for magpie, on its own codearts-token provider: import agent2api account JSON exports — models, credit rates, credit usage and the daily check-in (unofficial)",
   "type": "module",
   "main": "./opencode.mjs",

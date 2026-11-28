@@ -4748,11 +4748,43 @@ async function fetchOfficeAceUsage(cred, fetcher = fetch) {
 }
 
 /**
+ * The check-in's refusal of an account with no package: `403
+ * {"error_code":"OfficeAce.11020604","error_msg":"未订购套餐"}` (plugins #1682,
+ * a new account that never opened the free 「个人体验版」).
+ */
+const OA_NO_PACKAGE_CODE = "OfficeAce.11020604"
+
+/**
+ * What a user with no package does about it. The plugin never opens the trial
+ * itself: OfficeAce's own client opens it only when the user presses its
+ * free-plan button on the plan page (the trial's start time is that press, not
+ * the sign-up), and an order — even a ¥0 one — is the user's to place.
+ */
+const OA_NO_PACKAGE_MESSAGE =
+  "这个账号没有已开通的套餐（OfficeAce.11020604 未订购套餐），所以不能签到。" +
+  "请先在果办（OfficeAce）客户端的套餐页免费开通「个人体验版」（¥0），" +
+  "再回到 magpie 点「立即签到」。"
+
+/** Is this failed check-in answer OfficeAce saying the account has no package? */
+function isOfficeAceNoPackage(status, text) {
+  if (status < 400 || status >= 500) return false
+  let j
+  try {
+    j = JSON.parse(text)
+  } catch {
+    return false
+  }
+  return j?.error_code === OA_NO_PACKAGE_CODE || j?.error_msg === "未订购套餐"
+}
+
+/**
  * `POST {SUB}/v1/subscription/bonus/claim` — the daily check-in.
  *
  * Claiming twice is idempotent: a 2xx with no `bonus_skus` is `done` (today's
  * already taken), not a failure. A 2xx that does not parse is `done` too (the
- * claim itself may have gone through).
+ * claim itself may have gone through). An account with no package can't take
+ * part: `ineligible`, with what to open and where, not a failure magpie tries
+ * again all day.
  */
 async function officeAceCheckin(cred, fetcher = fetch) {
   if (!cred?.access_key_id || !cred?.security_token) {
@@ -4760,6 +4792,7 @@ async function officeAceCheckin(cred, fetcher = fetch) {
   }
   const r = await officeAceSigned(cred, `${OA_SUBSCRIPTION_BASE}${OA_BONUS_CLAIM_PATH}`, "POST", undefined, fetcher)
   if (!r.ok || r.status < 200 || r.status >= 300) {
+    if (isOfficeAceNoPackage(r.status, r.text)) return { outcome: "ineligible", message: OA_NO_PACKAGE_MESSAGE }
     const detail = r.text.trim().slice(0, 200)
     return {
       outcome: "failed",
